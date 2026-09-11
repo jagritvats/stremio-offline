@@ -1,0 +1,16 @@
+{
+  "name": "@stremio-offline/addon-server",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "The hosted half of Stremio Offline: a public Stremio addon served over HTTPS, installed by URL the way Torrentio is.",
+  "scripts": {
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@stremio-offline/addon-core": "workspace:*",
+    "@stremio-offline/addon-proxy": "workspace:*",
+    "@stremio-offline/models": "workspace:*",
+    "tsx": "^4.19.4"
+  }
+}

@@ -1,0 +1,130 @@
+# =============================================================================
+# Stremio Offline (hosted addon) — separate Compose project on the shared edge
+# =============================================================================
+# This stack does NOT run Traefik and does NOT own a TLS certificate. The Synpse
+# stack owns the edge: it binds host ports 80/443, terminates TLS with Cloudflare
+# Origin Certificates, and routes by Docker labels over the shared external
+# network (`synapse-edge`).
+#
+# Contract followed: d:/dev/projects/synpse/synpse/deploy/traefik-edge.md,
+# section "Adding Another App on a Different Domain".
+#
+# Consequences, do not break them:
+#   * no `ports:` on any service — Traefik owns 80/443 on the host
+#   * `traefik.docker.network` must name the shared network
+#   * the network must exist and Traefik must be running before `up`
+#   * soffline.synpse.app is under *.synpse.app, which the Synpse stack's existing
+#     wildcard Origin Cert already covers — no new certificate is needed. A host
+#     outside that zone would need its own cert in deploy/certs + deploy/tls.yml.
+#
+# Stateless by design. There is no volume here and that is not an oversight: the
+# addon stores nothing per user, because each install's configuration rides in
+# its own install URL (see apps/addon-server/src/config.ts). A redeploy, a
+# rollback or a destroyed container loses nothing, and no user data exists on
+# this host to lose.
+#
+# Run through deploy/docker/deploy.sh, which checks all of the above.
+# =============================================================================
+
+name: ${SOFF_COMPOSE_PROJECT_NAME:-soffline}
+
+services:
+  addon:
+    image: ${SOFF_IMAGE:?Set SOFF_IMAGE in deploy/.env.compose}:${SOFF_IMAGE_TAG:-latest}
+    restart: unless-stopped
+
+    environment:
+      PORT: "7000"
+      # Must stay 0.0.0.0. Traefik reaches this container over the shared Docker
+      # network, so a loopback bind here makes every request 502 with nothing in
+      # this container's logs to explain it.
+      HOST: "0.0.0.0"
+      NODE_ENV: production
+
+    # Internal only. Traefik reaches this over the shared network.
+    expose:
+      - "7000"
+
+    # Nothing is written at runtime, so nothing is granted. Binding port 7000 as
+    # the `node` user needs no capability at all.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      # `/health` and not `/manifest.json`: the manifest is built from a constant
+      # and would answer even if routing were broken.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    labels:
+      - traefik.enable=true
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-synapse-edge}"
+      - "traefik.http.routers.soffline.rule=${SOFF_HOST_RULE:?Set SOFF_HOST_RULE in deploy/.env.compose}"
+      - traefik.http.routers.soffline.entrypoints=websecure
+      - traefik.http.routers.soffline.tls=true
+      - traefik.http.services.soffline.loadbalancer.server.port=7000
+
+      # READ THIS BEFORE LOWERING THE PRIORITY
+      # ---------------------------------------------------------------------
+      # 110, not the 10 that the other apps on this edge use, and the difference
+      # matters here in a way it does not for them.
+      #
+      # traefik-edge.md gives SYNAPSE_HOST_RULE a default that ends in
+      # `HostRegexp(.+\.synpse\.app)`. That regexp matches soffline.synpse.app.
+      # If the VM is ever configured with that default, two Synpse routers also
+      # match our host: the frontend catch-all at priority 10, and the backend at
+      # priority 100 on `(host rule) && PathPrefix(/api)`.
+      #
+      # At priority 10 we would be tied with the Synpse frontend and the winner
+      # would be decided by rule length, which is not something to bet a public
+      # addon on. At 110 we are above both, and because our own rule matches ONLY
+      # soffline.synpse.app, being above them cannot take a single request away
+      # from Synpse's own hosts.
+      #
+      # The failure this avoids is quiet: Stremio installs the addon, then every
+      # `/manifest.json` fetch returns the Synpse frontend's HTML, and the client
+      # reports the addon as broken with nothing wrong in these logs.
+      - traefik.http.routers.soffline.priority=${SOFF_ROUTER_PRIORITY:-110}
+
+      # Rate limit, at the edge, before anything reaches the addon.
+      #
+      # Every Stremio addon is unauthenticated — that is the protocol, not a gap
+      # here. The exposure is not data: this server holds none. It is that each
+      # `/stream/...` call will, once addon-proxy exists, fan out into requests
+      # against the user's configured upstream addons. Unbounded, this host
+      # becomes an open amplifier pointed at Torrentio and friends, and gets our
+      # VM's address blocked by them.
+      #
+      # `depth=1` reads the client from X-Forwarded-For because Traefik sits
+      # behind Cloudflare. Without it every visitor on earth shares one bucket,
+      # and the limit either never trips or locks everyone out at once.
+      #
+      # Generous, because a client opening a season fetches a manifest and a
+      # stream list per episode in a burst.
+      - "traefik.http.middlewares.soffline-rate.ratelimit.average=${SOFF_RATE:-120}"
+      - "traefik.http.middlewares.soffline-rate.ratelimit.burst=${SOFF_RATE_BURST:-240}"
+      - traefik.http.middlewares.soffline-rate.ratelimit.period=1m
+      - traefik.http.middlewares.soffline-rate.ratelimit.sourcecriterion.ipstrategy.depth=1
+      - traefik.http.routers.soffline.middlewares=soffline-rate@docker
+
+    networks:
+      - edge
+
+networks:
+  # Owned by the Synpse stack. `external: true` makes Compose fail loudly instead
+  # of silently creating a second, unrouted network — on which every request
+  # would 404 at an edge that cannot see this container.
+  edge:
+    external: true
+    name: ${TRAEFIK_NETWORK:-synapse-edge}

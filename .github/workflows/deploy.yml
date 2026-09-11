@@ -1,0 +1,242 @@
+name: Build and deploy the hosted addon
+
+# Builds one ARM64 image, pushes it to GHCR, then deploys it to the VM as a
+# separate Compose project attached to the Traefik edge the Synpse stack owns.
+# This stack never publishes host ports and never handles TLS certificates.
+
+on:
+  push:
+    branches:
+      - main
+    # Only when something that ends up in the image or the deploy changes. The
+    # repo also carries an Android app, a design doc and a local runtime, and
+    # none of those belong to this lane.
+    paths:
+      - "apps/addon-server/**"
+      - "packages/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "deploy/docker/**"
+      - ".dockerignore"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag to deploy (a commit SHA). Leave empty to build and deploy HEAD. Use this to roll back."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+# One VM, one stack. Two deploys racing each other leaves whichever finishes
+# second in charge, which is not necessarily the newer one.
+concurrency:
+  group: soffline-vm
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm typecheck
+
+      # `--test` with no matching files is not an error, so this stays green
+      # while the packages are still skeletons and starts meaning something the
+      # moment a test is added.
+      - run: pnpm test
+
+  build:
+    name: Build and push image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    needs: check
+    # A dispatch that names an existing tag is a rollback: nothing to build.
+    if: github.event_name == 'push' || inputs.image_tag == ''
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image name
+        id: meta
+        shell: bash
+        run: |
+          # GHCR requires a lowercase path; GITHUB_REPOSITORY may be mixed case.
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "image=ghcr.io/${repo}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No secrets enter the image, because the hosted addon has none. Every
+      # per-user setting travels in that user's own install URL.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha,scope=soffline
+          cache-to: type=gha,mode=max,scope=soffline
+          provenance: false
+
+  deploy:
+    name: Deploy to VM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - build
+    # Runs after a successful build, or straight away for a rollback dispatch
+    # where the build job was skipped.
+    if: |
+      always()
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        || github.event_name == 'workflow_dispatch'
+      )
+    environment: PROD
+    steps:
+      - name: Checkout deploy files
+        uses: actions/checkout@v4
+
+      - name: Resolve image and tag
+        id: target
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.image_tag }}
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          tag="${REQUESTED_TAG:-$GITHUB_SHA}"
+          echo "image=ghcr.io/${repo}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Deploying ghcr.io/${repo}:${tag}"
+
+      - name: Install SSH key
+        shell: bash
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_SSH_HOST_KEY: ${{ secrets.VM_SSH_HOST_KEY }}
+        run: |
+          if [[ -z "$VM_HOST" ]]; then
+            echo "::error::Missing secret VM_HOST (the deploy VM hostname or IP)." >&2
+            exit 1
+          fi
+          if [[ -z "$VM_SSH_KEY" ]]; then
+            echo "::error::Missing secret VM_SSH_KEY (the private half of a key authorised for VM_USER)." >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/soffline_deploy
+          chmod 600 ~/.ssh/soffline_deploy
+
+          # Pin the host key when we have been given one. `StrictHostKeyChecking=yes`
+          # below only means "refuse a host that disagrees with known_hosts" — it
+          # says nothing about how known_hosts was filled. Scanning the host on
+          # every run and then strict-checking against that scan is
+          # trust-on-first-use, every time: whatever answers on port 22 at deploy
+          # time is believed, and this job hands it an SSH key.
+          if [[ -n "$VM_SSH_HOST_KEY" ]]; then
+            printf '%s\n' "$VM_SSH_HOST_KEY" > ~/.ssh/known_hosts
+            echo "Pinned the VM host key from VM_SSH_HOST_KEY."
+          else
+            echo "::warning::VM_SSH_HOST_KEY is not set, so this deploy trusts whatever host answers at $VM_HOST. Set it to the verified 'ssh-keyscan' line for the VM."
+            ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload deploy files
+        shell: bash
+        env:
+          COMPOSE_ENV: ${{ secrets.COMPOSE_ENV }}
+          VM_APP_DIR: ${{ secrets.VM_APP_DIR || vars.VM_APP_DIR || '/home/ubuntu/soffline/app' }}
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          if [[ -z "$VM_USER" ]]; then
+            echo "::error::Missing secret VM_USER (the SSH login on the deploy VM)." >&2
+            exit 1
+          fi
+
+          SSH=(ssh -i ~/.ssh/soffline_deploy -o StrictHostKeyChecking=yes)
+          SCP=(scp -i ~/.ssh/soffline_deploy -o StrictHostKeyChecking=yes)
+
+          "${SSH[@]}" "$VM_USER@$VM_HOST" "mkdir -p '$VM_APP_DIR/deploy'"
+
+          "${SCP[@]}" deploy/docker/compose.yaml          "$VM_USER@$VM_HOST:$VM_APP_DIR/deploy/compose.yaml"
+          "${SCP[@]}" deploy/docker/deploy.sh             "$VM_USER@$VM_HOST:$VM_APP_DIR/deploy/deploy.sh"
+          "${SCP[@]}" deploy/docker/.env.compose.example  "$VM_USER@$VM_HOST:$VM_APP_DIR/deploy/.env.compose.example"
+
+          # Optional. Written only when the secret exists, so an unset secret never
+          # wipes a hand-edited file on the VM. Contents are never echoed.
+          if [[ -n "$COMPOSE_ENV" ]]; then
+            umask 077
+            printf '%s\n' "$COMPOSE_ENV" > /tmp/soff.env.compose
+            "${SCP[@]}" /tmp/soff.env.compose "$VM_USER@$VM_HOST:$VM_APP_DIR/deploy/.env.compose"
+            rm -f /tmp/soff.env.compose
+            echo "Wrote deploy/.env.compose from the COMPOSE_ENV secret."
+          else
+            echo "COMPOSE_ENV not set; keeping the deploy/.env.compose already on the VM."
+          fi
+
+          "${SSH[@]}" "$VM_USER@$VM_HOST" \
+            "chmod 600 '$VM_APP_DIR/deploy/.env.compose' 2>/dev/null || true"
+
+      - name: Pull and restart containers
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+          SOFF_IMAGE: ${{ steps.target.outputs.image }}
+          SOFF_IMAGE_TAG: ${{ steps.target.outputs.tag }}
+          VM_APP_DIR: ${{ secrets.VM_APP_DIR || vars.VM_APP_DIR || '/home/ubuntu/soffline/app' }}
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          # Image and tag are passed as environment overrides rather than written
+          # into .env.compose, so a rollback dispatch cannot clobber the
+          # operator's host rule or router priority.
+          ssh -i ~/.ssh/soffline_deploy -o StrictHostKeyChecking=yes "$VM_USER@$VM_HOST" \
+            "VM_APP_DIR='$VM_APP_DIR' SOFF_IMAGE='$SOFF_IMAGE' SOFF_IMAGE_TAG='$SOFF_IMAGE_TAG' SOFF_GHCR_USERNAME='$GHCR_USERNAME' SOFF_GHCR_TOKEN='$GHCR_TOKEN' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$VM_APP_DIR/deploy"
+          chmod +x deploy.sh
+          bash deploy.sh deploy
+          REMOTE
+
+      - name: Remove SSH key
+        if: always()
+        shell: bash
+        run: rm -f ~/.ssh/soffline_deploy

@@ -1,0 +1,44 @@
+# Keep the build context small and keep local state out of the image.
+#
+# node_modules first and foremost: without it every `docker build` ships a
+# laptop's installed tree into the context, which is both slow and wrong — those
+# are the host's binaries, not linux/arm64 ones.
+
+node_modules
+**/node_modules
+.git
+.gitignore
+.gitattributes
+.editorconfig
+
+# Local runtime state. `data/` holds downloads and config on a developer machine
+# and must never reach a published image.
+data
+*.log
+.env
+.env.*
+
+# Not part of the hosted addon.
+apps/android-runtime
+docs
+init.md
+README.md
+CLAUDE.md
+
+# The deploy lane itself. The Dockerfile is passed with `-f`, so nothing in here
+# needs to be inside the context.
+deploy
+.github
+
+# Build leftovers
+dist
+build
+*.tsbuildinfo
+.pnpm-store
+target
+
+# Editors / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db

@@ -34,3 +34,12 @@ target/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local prompt/notes
+/init.md
+
+# Deploy templates must stay committed. The `.env.*` rule above otherwise
+# swallows deploy/docker/.env.compose.example, and CI uploads that template to
+# the VM straight from the checkout — so an ignored template is a deploy that
+# cannot run `deploy.sh init`. The real .env.compose stays ignored.
+!.env.compose.example
