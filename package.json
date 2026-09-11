@@ -1,0 +1,22 @@
+{
+  "name": "stremio-offline",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Persistent offline downloads for stock Stremio, delivered as a localhost addon + background runtime.",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test \"packages/*/src/**/*.test.ts\" \"apps/desktop-runtime/src/**/*.test.ts\"",
+    "runtime": "pnpm --filter @stremio-offline/desktop-runtime start",
+    "spike:1": "pnpm --filter @stremio-offline/desktop-runtime spike:1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

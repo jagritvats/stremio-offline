@@ -1,0 +1,16 @@
+{
+  "name": "@stremio-offline/desktop-runtime",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "spike:1": "tsx src/main.ts spike1"
+  },
+  "dependencies": {
+    "@stremio-offline/addon-core": "workspace:*",
+    "@stremio-offline/addon-proxy": "workspace:*",
+    "@stremio-offline/download-core": "workspace:*",
+    "@stremio-offline/models": "workspace:*"
+  }
+}

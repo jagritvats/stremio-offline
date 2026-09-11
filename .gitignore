@@ -1,0 +1,36 @@
+# Node
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.pnpm-store/
+npm-debug.log*
+pnpm-debug.log*
+
+# Runtime data (never commit user config, secrets, downloads)
+data/
+*.log
+.env
+.env.*
+
+# Android
+apps/android-runtime/local.properties
+apps/android-runtime/.gradle/
+apps/android-runtime/**/build/
+apps/android-runtime/.idea/
+apps/android-runtime/captures/
+apps/android-runtime/.kotlin/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Rust (future native pieces)
+target/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
