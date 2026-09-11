@@ -22,7 +22,7 @@ COMPOSE_FILE="compose.yaml"
 
 # The id in the served manifest. The edge check below matches on this, not on a
 # 200, because a misrouted request also returns 200 — with somebody else's page.
-ADDON_ID="app.synpse.soffline"
+ADDON_ID="community.stremio-offline.local"
 
 compose() { docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
 

@@ -10,7 +10,7 @@ never binds host ports and never handles a TLS certificate.
 
 | | |
 |---|---|
-| Deployed here | the addon manifest, the `stream` / `catalog` / `meta` endpoints, the configure page |
+| Deployed here | the addon manifest, the `stream` endpoint, the configure page |
 | **Not** deployed here | `apps/desktop-runtime`, `apps/android-runtime`, the download engine, any file anyone downloads |
 
 That split is not a staging decision, it is the architecture. `DESIGN.md` §1: a
@@ -81,7 +81,7 @@ thing that goes wrong here answers `200` with someone else's HTML:
 curl -s https://soffline.synpse.app/manifest.json | head -c 200
 ```
 
-Expect JSON whose `id` is `app.synpse.soffline`.
+Expect JSON whose `id` is `community.stremio-offline.local` — the id comes from `packages/addon-core`, and hosted and local serve the same addon identity.
 
 To install into Stremio: open `https://soffline.synpse.app/`, add a configured
 source addon URL, and press **Install into Stremio**.
