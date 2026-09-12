@@ -16,6 +16,7 @@ export function formatBytes(bytes: number | undefined): string | undefined {
 /** Whole-number percentage string, e.g. "58%"; undefined when total is unknown. */
 export function formatPercent(done: number, total: number | undefined): string | undefined {
   if (total === undefined || !(total > 0)) return undefined;
-  const percent = Math.floor((done / total) * 100);
+  // Floor, but not through float noise: 58/100*100 is 57.999…, and that is 58%, not 57%.
+  const percent = Math.floor((done / total) * 100 + 1e-9);
   return `${Math.max(0, Math.min(100, percent))}%`;
 }

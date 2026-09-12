@@ -13,7 +13,8 @@
     "test": "node --import tsx --test \"packages/*/src/**/*.test.ts\" \"apps/desktop-runtime/src/**/*.test.ts\" \"apps/addon-server/src/**/*.test.ts\"",
     "runtime": "pnpm --filter @stremio-offline/desktop-runtime start",
     "addon": "pnpm --filter @stremio-offline/addon-server start",
-    "spike:1": "pnpm --filter @stremio-offline/desktop-runtime spike:1"
+    "spike:1": "pnpm --filter @stremio-offline/desktop-runtime spike:1",
+    "register": "pnpm --filter @stremio-offline/desktop-runtime register"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
