@@ -1,4 +1,4 @@
-import type { MediaType, SourceAddon, StremioManifest, StremioStream } from "@stremio-offline/models";
+import type { MediaType, SourceAddon, StremioManifest, StremioMeta, StremioStream } from "@stremio-offline/models";
 
 export interface FetchResponseLike {
   ok: boolean;
@@ -34,6 +34,10 @@ export function streamsUrl(transportUrl: string, type: MediaType, id: string): s
   return `${transportUrl.replace(/\/+$/, "")}/stream/${type}/${encodeURIComponent(id)}.json`;
 }
 
+export function metaUrl(transportUrl: string, type: MediaType, id: string): string {
+  return `${transportUrl.replace(/\/+$/, "")}/meta/${type}/${encodeURIComponent(id)}.json`;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -66,6 +70,20 @@ export class UpstreamClient {
     const streams = isObject(data) ? data["streams"] : undefined;
     if (!Array.isArray(streams)) throw new UpstreamError("invalid streams response", addon.id);
     return streams.filter(isObject) as StremioStream[];
+  }
+
+  /** Meta for one title; null when the addon has none (404, or an empty meta). */
+  async fetchMeta(addon: Pick<SourceAddon, "id" | "transportUrl">, type: MediaType, id: string): Promise<StremioMeta | null> {
+    let data: unknown;
+    try {
+      data = await this.#getJson(metaUrl(addon.transportUrl, type, id), addon.id);
+    } catch (error) {
+      if (error instanceof UpstreamError && error.status === 404) return null;
+      throw error;
+    }
+    const meta = isObject(data) ? data["meta"] : undefined;
+    if (!isObject(meta) || typeof meta["id"] !== "string" || typeof meta["name"] !== "string") return null;
+    return meta as unknown as StremioMeta;
   }
 
   async #getJson(url: string, addonId: string): Promise<unknown> {

@@ -4,25 +4,35 @@ Build order from [DESIGN.md §23](DESIGN.md#23-critical-build-order). Each spike
 
 | # | Spike | Windows | Android | Notes |
 |---|-------|---------|---------|-------|
-| 1 | Action integration (`externalUrl` → custom URI handler) | ☐ | ☐ | make-or-break · runnable, see below |
-| 2 | Local playback (`url` → localhost file endpoint with Range) | ☐ | ☐ | |
-| 3 | Upstream proxy (normalise one source addon into `⬇ OFFLINE`) | ☐ | ☐ | |
-| 4 | Torrent (infoHash + fileIdx → file → `✅ OFFLINE`) | ☐ | ☐ | |
-| 5 | Persistence (queue → kill → restart → resume → offline play) | ☐ | ☐ | |
+| 1 | Action integration (`externalUrl` → custom URI handler) | ☐ | ☐ | make-or-break · runnable: `pnpm spike:1` |
+| 2 | Local playback (`url` → localhost file endpoint with Range) | ☐ | ☐ | runnable: `pnpm runtime` with an HTTP source |
+| 3 | Upstream proxy (normalise one source addon into `⬇ OFFLINE`) | ☐ | ☐ | runnable: `pnpm runtime` |
+| 4 | Torrent (infoHash + fileIdx → file → `✅ OFFLINE`) | ☐ | ☐ | not started: gated on Spike 1 (CLAUDE.md) |
+| 5 | Persistence (queue → kill → restart → resume → offline play) | ☐ | ☐ | runnable: `pnpm runtime` with an HTTP source |
 
 Legend: ☐ not run · ✅ pass · ❌ fail (link the finding)
 
 ## Plan
 
-The libraries are ahead of the spikes. `models`, `addon-core`, `addon-proxy` and `download-core` are built and unit-tested, with `NoopEngine` standing in for a transfer engine. `apps/addon-server`, the hosted install-by-URL half, serves a real manifest and an empty stream list on purpose. `apps/desktop-runtime` is the bare minimum that makes Spike 1 runnable and nothing more. `apps/android-runtime` is a README.
+What is built, and what is next in the order it gets done.
 
-Each step unblocks the next. Nothing past step 1 starts until Spike 1 is recorded as ✅ on Windows.
+Built and unit-tested:
 
-1. **Spike 1** — run it (below) on Windows. Android needs the Kotlin deep-link activity that does what `dispatch` does: POST the URI to the runtime's `/api/action` with the install secret, then `finish()`.
-2. **Spike 2** — `/media/:jobId` in the runtime: `HEAD`/`GET` with `Range` over a file on disk. `completedStream()` in addon-core already builds the `✅ OFFLINE` entry for it.
-3. **Spike 3** — the real `stream` handler: `collectOfflineSources` → `SourceRegistry.register` → `presentSource`, and `enqueue/<token>` on `/api/action` → `DownloadManager.enqueue`, still on `NoopEngine`. Source addon URLs join `runtime.json` and go nowhere else.
-4. **Spike 4** — the first `DownloadEngine`: HTTP with Range and resume, then torrent (`infoHash` + `fileIdx`), replacing `NoopEngine`.
-5. **Spike 5** — `JsonFileJobStore` wired into the runtime, start with the OS, the kill/restart/resume acceptance test, `OfflineMeta` snapshots for the offline catalogs.
+- `models`; `addon-core` (manifest, router, presenter, `/media` with Range, offline catalog + meta); `addon-proxy` (upstream client incl. meta, normaliser, dedupe, aggregator); `download-core` (job store, meta store, source registry, download manager, HTTP engine with Range resume).
+- `apps/desktop-runtime`: the runtime (`pnpm runtime`). Stream handler over the configured source addons; `enqueue/<token>` plus pause, resume, retry and cancel actions; `/media/<jobId>`; the offline library; jobs and metadata snapshots persisted under `~/.stremio-offline`; partial downloads resumed on restart. Plus the Spike 1 addon, the `stremio-offline://` dispatcher and OS registration.
+- `apps/addon-server`: the hosted install-by-URL half; empty stream list on purpose.
+
+Not built:
+
+- The torrent engine (Spike 4). CLAUDE.md gates it on Spike 1. Until it exists the runtime lists only sources an engine can transfer, so torrent streams from upstream addons are not offered as `⬇ OFFLINE` yet (the log says how many were hidden).
+- `apps/android-runtime` (README only).
+
+Next, in order:
+
+1. **Spike 1 on Windows** (below). Everything hinges on it.
+2. **Spikes 2, 3 and 5 against real Stremio** with an HTTP source (below): seeking, subtitles and resume in Stremio's player; kill and restart mid-download; play with the network off.
+3. **Torrent engine** (Spike 4), behind the same `DownloadEngine` interface, picked by `source.type`.
+4. **Android**: a deep-link activity that does what `dispatch` does (POST the URI to `/api/action` with the install secret), then the runtime pieces in Kotlin.
 
 ## Running Spike 1
 
@@ -51,3 +61,22 @@ Without Stremio, everything but the tap can be exercised by opening the URI the 
 ```sh
 pnpm runtime dispatch "stremio-offline://test?id=tt0816692"
 ```
+
+## Running the runtime (Spikes 2, 3 and 5, with an HTTP source)
+
+Same install secret, port and handler as Spike 1. Stop `pnpm spike:1` first: they share the port, and the two addons share an id, so installing one replaces the other in Stremio.
+
+```sh
+pnpm register                                       # once
+pnpm runtime sources add <manifest URL of a stream addon>   # validated by fetching its manifest
+pnpm runtime storage "D:\Movies"                    # optional; default is ~/Downloads/Stremio Offline
+pnpm runtime                                        # leave it running
+```
+
+`sources list`, `sources remove <id>`, `sources enable|disable <id>` manage the addons; the running runtime picks up source changes on the next stream request, a storage change needs a restart. Install `http://127.0.0.1:34701/manifest.json` into Stremio.
+
+- **Spike 3.** Open a title. Every downloadable upstream stream is listed once as `⬇ OFFLINE • <quality>` with its size and the providers offering it; the same source from two addons is one entry. Only `http(s)` sources are offered today; torrent streams wait for Spike 4.
+- **Spike 2.** Tap an HTTP entry. The terminal logs `queued`, `downloading` and `complete`; in Stremio the entry reads `⏳ N% DOWNLOADED` while it runs and `✅ OFFLINE` when done. Tap that: Stremio's own player plays `http://127.0.0.1:34701/media/<jobId>`. Check seeking, resume-from-position and subtitles.
+- **Spike 5.** Tap an entry, stop the runtime mid-download (Ctrl-C), start it again: the log shows `downloading` again and the `.part` file grows from where it stopped. Once complete, disconnect from the network and restart Stremio: Discover → Offline Movies / Offline Series lists the title, and its `✅ OFFLINE` entry plays.
+
+State lives in `~/.stremio-offline`: `runtime.json` (port, install secret, source addons, storage folder), `jobs.json`, and `meta/` (metadata snapshots taken when a download is queued). Finished files go to `<storage>/Movies/<Title>/` and `<storage>/Series/<Title>/`; a download in progress is `<file>.part`. `apps/desktop-runtime/src/runtime.test.ts` shows the smallest source addon this can be tested against.
