@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/main.ts",
-    "spike:1": "tsx src/main.ts spike1"
+    "spike:1": "tsx src/main.ts spike1",
+    "register": "tsx src/main.ts register"
   },
   "dependencies": {
     "@stremio-offline/addon-core": "workspace:*",
     "@stremio-offline/addon-proxy": "workspace:*",
     "@stremio-offline/download-core": "workspace:*",
-    "@stremio-offline/models": "workspace:*"
+    "@stremio-offline/models": "workspace:*",
+    "tsx": "^4.19.4"
   }
 }

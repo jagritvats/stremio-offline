@@ -47,6 +47,9 @@ importers:
       '@stremio-offline/models':
         specifier: workspace:*
         version: link:../../packages/models
+      tsx:
+        specifier: ^4.19.4
+        version: 4.23.13
 
   packages/addon-core:
     dependencies:
