@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { isActiveJob, mediaScopeKey, type DownloadJob, type JobMedia } from "@stremio-offline/models";
+import { isActiveJob, mediaScopeKey, type DownloadJob, type JobMedia, type OfflineSource } from "@stremio-offline/models";
 import { planLocalPath, withSuffix } from "./paths.ts";
 import type { RegisteredSource } from "./source-registry.ts";
 import type { JobStore } from "./store.ts";
@@ -25,6 +25,8 @@ export interface EngineEvents {
  * is expected to continue from whatever is already on disk (DESIGN §18).
  */
 export interface DownloadEngine {
+  /** Whether this engine can transfer the source at all. Absent means everything. */
+  supports?(source: OfflineSource): boolean;
   start(job: DownloadJob, events: EngineEvents): Promise<void> | void;
   pause(job: DownloadJob): Promise<void> | void;
   cancel(job: DownloadJob, deleteFiles: boolean): Promise<void> | void;

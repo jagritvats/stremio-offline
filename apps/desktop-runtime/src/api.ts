@@ -6,8 +6,10 @@ export interface ApiOptions {
   /** The install secret from runtime.json. */
   secret: string;
   version: string;
-  /** Handles a parsed action URI; whatever it returns is echoed to the dispatcher. */
+  /** Handles a parsed action URI; whatever it returns is echoed to the dispatcher. A throw becomes a 400. */
   onAction: (action: ActionRequest) => Promise<unknown> | unknown;
+  /** Backs GET /api/jobs when present. */
+  listJobs?: () => Promise<unknown>;
 }
 
 function digest(value: string): Buffer {
@@ -39,6 +41,11 @@ export function apiRoute(options: ApiOptions): RouteHandler {
       return true;
     }
 
+    if (url.pathname === "/api/jobs" && method === "GET" && options.listJobs) {
+      sendJson(res, 200, { jobs: await options.listJobs() });
+      return true;
+    }
+
     if (url.pathname === "/api/action" && method === "POST") {
       let body: unknown;
       try {
@@ -53,8 +60,12 @@ export function apiRoute(options: ApiOptions): RouteHandler {
         sendJson(res, 400, { error: 'body must be { "uri": "stremio-offline://..." }' });
         return true;
       }
-      const result = await options.onAction(action);
-      sendJson(res, 200, { ok: true, action: action.action, result: result ?? null });
+      try {
+        const result = await options.onAction(action);
+        sendJson(res, 200, { ok: true, action: action.action, result: result ?? null });
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
       return true;
     }
 
