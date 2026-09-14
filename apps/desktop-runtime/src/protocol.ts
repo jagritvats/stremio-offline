@@ -33,11 +33,11 @@ export function dispatchCommand(): string[] {
 }
 
 /** Register stremio-offline:// for the current user. Returns a line describing what was done. */
-export async function registerProtocol(): Promise<string> {
+export async function registerProtocol(home: string): Promise<string> {
   const command = dispatchCommand();
   switch (process.platform) {
     case "win32":
-      return registerWindows(command);
+      return registerWindows(home, command);
     case "linux":
       return registerLinux(command);
     default:
@@ -45,14 +45,57 @@ export async function registerProtocol(): Promise<string> {
   }
 }
 
+/**
+ * The Windows shim. Registering `node.exe` directly works, but every tap in
+ * Stremio flashes a console window for as long as the dispatcher lives. Windows
+ * has no command-line flag for that, so the registered handler is `wscript.exe`
+ * running this script, which starts the same command with the window hidden.
+ */
+export function dispatchScript(command: string[]): string {
+  for (const part of command) {
+    // Windows paths cannot contain a quote, so this only fires on something malformed.
+    if (part.includes('"')) throw new Error(`cannot register a path containing a quote: ${part}`);
+  }
+  return [
+    "' Stremio Offline: runs the stremio-offline:// dispatcher with no console window.",
+    "' Written by `pnpm register`. Re-run that if the checkout moves.",
+    "Option Explicit",
+    "Dim shell, commandLine, i, parts",
+    'Set shell = CreateObject("WScript.Shell")',
+    `parts = Array(${command.map((part) => `"${part}"`).join(", ")})`,
+    'commandLine = ""',
+    "For i = 0 To UBound(parts)",
+    '  commandLine = commandLine & Chr(34) & parts(i) & Chr(34) & " "',
+    "Next",
+    "' The URI Stremio opened. Quotes are dropped rather than escaped: a",
+    "' stremio-offline:// URI has no legitimate use for one, and this string",
+    "' becomes a command line.",
+    "For i = 0 To WScript.Arguments.Count - 1",
+    '  commandLine = commandLine & Chr(34) & Replace(WScript.Arguments(i), Chr(34), "") & Chr(34) & " "',
+    "Next",
+    "' 0 hides the window; False returns without waiting for the dispatcher.",
+    "shell.Run commandLine, 0, False",
+    "",
+  ].join("\r\n");
+}
+
 // HKCU only: no elevation, and it is this user's Stremio that dispatches the URI.
-async function registerWindows(command: string[]): Promise<string> {
+async function registerWindows(home: string, command: string[]): Promise<string> {
   const key = `HKCU\\Software\\Classes\\${ACTION_SCHEME}`;
-  const commandLine = `${command.map((part) => `"${part}"`).join(" ")} "%1"`;
+  const scriptPath = join(home, "dispatch.vbs");
+  await mkdir(home, { recursive: true });
+  await writeFile(scriptPath, dispatchScript(command), "utf8");
+
+  const wscript = join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "wscript.exe");
+  const commandLine = `"${wscript}" "${scriptPath}" "%1"`;
   await run("reg", ["add", key, "/ve", "/d", "URL:Stremio Offline", "/f"]);
   await run("reg", ["add", key, "/v", "URL Protocol", "/t", "REG_SZ", "/d", "", "/f"]);
   await run("reg", ["add", `${key}\\shell\\open\\command`, "/ve", "/d", commandLine, "/f"]);
-  return `registered ${ACTION_SCHEME}:// under ${key}\n  handler: ${commandLine}`;
+  return [
+    `registered ${ACTION_SCHEME}:// under ${key}`,
+    `  handler: ${commandLine}`,
+    `  ${scriptPath} starts the dispatcher hidden, so tapping a stream flashes no console window`,
+  ].join("\n");
 }
 
 // Desktop Entry spec: arguments with reserved characters go in double quotes,

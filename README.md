@@ -16,7 +16,7 @@ packages/
 apps/
   desktop-runtime/ Node runtime on 127.0.0.1: source addons → ⬇/⏳/✅ entries, /api behind the install secret, /media, offline library, stremio-offline:// dispatcher
   addon-server/    hosted install-by-URL addon (manifest + configure page); deployed from deploy/docker
-  android-runtime/ Kotlin: deep-link activity, foreground service (scaffold)
+  android-runtime/ Kotlin: Spike 1 app — loopback addon, deep-link activity, foreground service (never compiled)
 deploy/docker/     the hosted addon's image, Compose project and deploy lane
 docs/
 ```
@@ -31,6 +31,7 @@ pnpm register     # once: stremio-offline:// → the local runtime (Windows, Lin
 pnpm spike:1      # start the hello-offline addon for Spike 1 (docs/SPIKES.md)
 pnpm runtime sources add <manifest url>   # add a stream addon to mirror
 pnpm runtime      # start the runtime: HTTP downloads, /media playback, offline library
+pnpm runtime jobs # list downloads; jobs pause|resume|cancel <id> acts on one
 ```
 
 Requires Node 22+ and pnpm 9.

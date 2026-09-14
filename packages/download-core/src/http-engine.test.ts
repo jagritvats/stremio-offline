@@ -6,7 +6,14 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JobMedia, NormalizedSource } from "@stremio-offline/models";
-import { HttpEngine, parseContentRange, partPath, suggestedExtension } from "./http-engine.ts";
+import {
+  HttpEngine,
+  isTransientFailure,
+  isTransientStatus,
+  parseContentRange,
+  partPath,
+  suggestedExtension,
+} from "./http-engine.ts";
 import { DownloadManager } from "./manager.ts";
 import type { RegisteredSource } from "./source-registry.ts";
 import { MemoryJobStore } from "./store.ts";
@@ -24,14 +31,33 @@ interface ContentServer {
   close(): Promise<void>;
 }
 
-async function contentServer(options: { ranges?: boolean; disposition?: string } = {}): Promise<ContentServer> {
+interface ServerOptions {
+  ranges?: boolean;
+  disposition?: string;
+  /** Answer the first N requests with this status instead of the file. */
+  failFirst?: { times: number; status: number };
+  /** Cut the connection after this many bytes, once. */
+  dropAfter?: number;
+  /** Pause between chunks, so the client has read some of them before a drop. */
+  chunkDelayMs?: number;
+}
+
+async function contentServer(options: ServerOptions = {}): Promise<ContentServer> {
   const seen: Array<string | undefined> = [];
   let hold: { after: number; promise: Promise<void>; release: () => void } | undefined;
+  let failures = options.failFirst?.times ?? 0;
+  let drops = options.dropAfter === undefined ? 0 : 1;
   const server = createServer(async (req, res) => {
     res.on("error", () => {});
     seen.push(req.headers.range);
     if (req.url === "/missing") {
       res.writeHead(404);
+      res.end();
+      return;
+    }
+    if (failures > 0) {
+      failures -= 1;
+      res.writeHead(options.failFirst?.status ?? 503);
       res.end();
       return;
     }
@@ -59,8 +85,15 @@ async function contentServer(options: { ranges?: boolean; disposition?: string }
     for (let pos = start; pos <= end; pos += CHUNK) {
       if (res.destroyed) return;
       const chunk = DATA.subarray(pos, Math.min(pos + CHUNK, end + 1));
-      res.write(chunk);
+      // Await the write callback: the drop below must lose the connection, not the bytes already sent.
+      await new Promise<void>((resolve) => res.write(chunk, () => resolve()));
       sent += chunk.length;
+      if (options.chunkDelayMs) await new Promise((resolve) => setTimeout(resolve, options.chunkDelayMs));
+      if (drops > 0 && options.dropAfter !== undefined && sent >= options.dropAfter) {
+        drops -= 1;
+        res.destroy();
+        return;
+      }
       if (hold && sent >= hold.after) await hold.promise;
     }
     res.end();
@@ -96,8 +129,8 @@ function registered(url: string): RegisteredSource {
   return { token: "t", source, media, createdAt: 0 };
 }
 
-function setup(dir: string) {
-  const engine = new HttpEngine({ progressIntervalMs: 0 });
+function setup(dir: string, engineOptions: ConstructorParameters<typeof HttpEngine>[0] = {}) {
+  const engine = new HttpEngine({ progressIntervalMs: 0, retryDelayMs: 1, ...engineOptions });
   const manager = new DownloadManager({ store: new MemoryJobStore(), engine, storageDir: dir });
   const statuses: string[] = [];
   manager.subscribe((event) => {
@@ -129,7 +162,7 @@ const untilBytes = (manager: DownloadManager, id: string, bytes: number) =>
   });
 
 async function withServer(
-  options: { ranges?: boolean; disposition?: string },
+  options: ServerOptions,
   run: (server: ContentServer, dir: string) => Promise<void>,
 ): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "so-http-"));
@@ -229,4 +262,68 @@ test("suggestedExtension and parseContentRange", () => {
   assert.deepEqual(parseContentRange("bytes 100-199/200"), { start: 100, end: 199, total: 200 });
   assert.deepEqual(parseContentRange("bytes 0-9/*"), { start: 0, end: 9 });
   assert.equal(parseContentRange("nope"), undefined);
+});
+
+test("a transient upstream failure is retried with backoff, and the file still lands intact", () =>
+  withServer({ failFirst: { times: 2, status: 503 } }, async (server, dir) => {
+    const { manager } = setup(dir);
+    const job = await manager.enqueue(registered(server.url));
+    const done = await untilStatus(manager, job.id, "complete");
+    assert.equal(server.seen.length, 3, "two rejections, then the transfer");
+    assert.ok(Buffer.from(await readFile(done.localPath)).equals(DATA));
+  }));
+
+test("a dropped connection is retried and resumes from the bytes that landed", () =>
+  // Node's fetch discards body chunks it has queued but not yet handed to the
+  // reader when a connection errors, so the resume offset is "what reached the
+  // disk", not "what the server sent". That is exactly what .part records.
+  withServer({ dropAfter: 3 * CHUNK, chunkDelayMs: 10 }, async (server, dir) => {
+    const { manager } = setup(dir);
+    const job = await manager.enqueue(registered(server.url));
+    const done = await untilStatus(manager, job.id, "complete");
+
+    assert.equal(server.seen.length, 2, "one drop, one retry");
+    const resumed = /^bytes=(\d+)-$/.exec(server.seen[1] ?? "");
+    assert.ok(resumed, `the retry resumes with a Range header, got ${String(server.seen[1])}`);
+    assert.ok(Number(resumed[1]) > 0, "and picks up from the bytes already on disk");
+    assert.ok(Buffer.from(await readFile(done.localPath)).equals(DATA), "the reassembled file is byte-identical");
+    assert.equal(done.bytesDownloaded, DATA.length);
+  }));
+
+test("retries are bounded, and a permanent failure is never retried", async () => {
+  await withServer({ failFirst: { times: 99, status: 503 } }, async (server, dir) => {
+    const { manager } = setup(dir, { retries: 2 });
+    const job = await manager.enqueue(registered(server.url));
+    const failed = await untilStatus(manager, job.id, "error");
+    assert.equal(failed.error, "upstream responded 503");
+    assert.equal(server.seen.length, 3, "the first attempt plus two retries");
+  });
+  await withServer({ failFirst: { times: 99, status: 403 } }, async (server, dir) => {
+    const { manager } = setup(dir);
+    const job = await manager.enqueue(registered(server.url));
+    const failed = await untilStatus(manager, job.id, "error");
+    assert.equal(failed.error, "upstream responded 403");
+    assert.equal(server.seen.length, 1, "a 403 will not get better by asking again");
+  });
+});
+
+test("pausing during a retry backoff stops it immediately", () =>
+  withServer({ failFirst: { times: 99, status: 503 } }, async (server, dir) => {
+    const { manager } = setup(dir, { retries: 50, retryDelayMs: 60_000 });
+    const job = await manager.enqueue(registered(server.url));
+    await waitFor(async () => (server.seen.length > 0 ? true : undefined));
+    const paused = await manager.pause(job.id);
+    assert.equal(paused?.status, "paused");
+    const attempts = server.seen.length;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(server.seen.length, attempts, "no attempt survives the pause");
+    assert.equal((await manager.get(job.id))?.status, "paused", "and it never flips to error");
+  }));
+
+test("failure classification", () => {
+  assert.ok(isTransientStatus(503) && isTransientStatus(429) && isTransientStatus(408));
+  assert.ok(!isTransientStatus(404) && !isTransientStatus(403) && !isTransientStatus(416));
+  assert.ok(isTransientFailure(new Error("fetch failed")), "a network error is worth another try");
+  assert.ok(!isTransientFailure(Object.assign(new Error("no space"), { code: "ENOSPC" })));
+  assert.ok(!isTransientFailure(Object.assign(new Error("denied"), { code: "EACCES" })));
 });
