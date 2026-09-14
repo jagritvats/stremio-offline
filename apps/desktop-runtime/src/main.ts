@@ -1,6 +1,7 @@
 // Local runtime entry point. Binds 127.0.0.1 only.
 //
 //   pnpm runtime                        start the runtime (default command)
+//   pnpm runtime jobs                   list downloads; jobs pause|resume|cancel <id> acts on one
 //   pnpm runtime sources list|add <manifestUrl>|remove <id>|enable <id>|disable <id>
 //   pnpm runtime storage [<dir>]        show or set the download folder (restart the runtime after a change)
 //   pnpm spike:1                        the hello-offline addon of DESIGN §7 / §23 Spike 1
@@ -9,16 +10,28 @@
 
 import { listen } from "@stremio-offline/addon-core";
 import { UpstreamClient } from "@stremio-offline/addon-proxy";
-import { ACTION_SCHEME } from "./action.ts";
-import { configPath, loadOrCreateConfig, readConfig, runtimeHome } from "./config.ts";
+import { ACTION_SCHEME, type ActionRequest } from "./action.ts";
+import { connect } from "./client.ts";
+import { configPath, loadOrCreateConfig, runtimeHome } from "./config.ts";
+import { jobsTable, resolveJobId } from "./jobs-table.ts";
 import { registerProtocol } from "./protocol.ts";
 import { createRuntime } from "./runtime.ts";
 import { createRuntimeServer } from "./server.ts";
 import { addSource, describeSource, listSources, removeSource, setSourceEnabled, setStorageDir } from "./sources.ts";
 import { spike1Action, spike1Handlers, type Spike1State } from "./spike1.ts";
 
+// `pnpm runtime jobs | head -1` closes this process's stdout early, and a write
+// to a closed pipe raises an unhandled error event that ends the CLI in a stack
+// trace. Exiting quietly is what every other command-line tool does.
+process.stdout.on("error", (error: NodeJS.ErrnoException) => {
+  if (error.code === "EPIPE") process.exit(0);
+  throw error;
+});
+
 const VERSION = "0.0.1";
-const USAGE = "one of: start, sources <list|add|remove|enable|disable>, storage [dir], spike1, register, dispatch <uri>";
+const USAGE =
+  "one of: start, jobs [pause|resume|cancel <id>], sources <list|add|remove|enable|disable>, " +
+  "storage [dir], spike1, register, dispatch <uri>";
 
 function fail(message: string, code = 1): never {
   console.error(`stremio-offline: ${message}`);
@@ -63,6 +76,7 @@ async function start(): Promise<void> {
   console.log(`  sources   ${names.length > 0 ? names.join(", ") : "none yet: pnpm runtime sources add <manifest url>"}`);
   console.log(`  state     ${home}`);
   console.log(`  handler   ${ACTION_SCHEME}://   (run \`pnpm register\` once if you have not)`);
+  console.log("  downloads pnpm runtime jobs   (also: jobs pause|resume|cancel <id>)");
 
   // One line per status change, not per progress tick.
   const lastStatus = new Map<string, string>();
@@ -119,19 +133,38 @@ async function runSpike1(): Promise<void> {
 // It only forwards: the running runtime decides what the action means.
 async function dispatch(uri: string): Promise<void> {
   if (!uri.startsWith(`${ACTION_SCHEME}:`)) fail(`not a ${ACTION_SCHEME}:// URI: ${uri}`, 2);
-  const home = runtimeHome();
-  const config = await readConfig(home);
-  if (!config) fail(`no runtime state in ${home}; start the runtime first (pnpm runtime)`);
+  const client = await connect(runtimeHome()).catch((error: Error) => fail(error.message));
+  console.log(await client.raw(uri).catch((error: Error) => fail(error.message)));
+}
 
-  const response = await fetch(`http://127.0.0.1:${config.port}/api/action`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${config.secret}`, "content-type": "application/json" },
-    body: JSON.stringify({ uri }),
-  }).catch(() => fail(`the runtime is not running on 127.0.0.1:${config.port}`));
+/** `jobs` and the one-job commands, all of which go through the same action surface. */
+async function jobs(args: string[]): Promise<void> {
+  const [verb = "list", typed] = args;
+  const client = await connect(runtimeHome()).catch((error: Error) => fail(error.message));
+  const all = await client.jobs().catch((error: Error) => fail(error.message));
 
-  const body = await response.text();
-  if (!response.ok) fail(`the runtime rejected the action (${response.status}): ${body}`);
-  console.log(body);
+  if (verb === "list") {
+    for (const line of jobsTable(all)) console.log(line);
+    return;
+  }
+  const actions: Record<string, ActionRequest["action"]> = {
+    pause: "pause",
+    resume: "resume",
+    retry: "resume",
+    cancel: "cancel",
+  };
+  const action = actions[verb];
+  if (!action) fail(`unknown jobs command "${verb}"; one of: list, pause, resume, cancel`, 2);
+  if (!typed) fail(`jobs ${verb} needs a job id; run \`pnpm runtime jobs\` to list them`, 2);
+
+  const id = ((): string => {
+    try {
+      return resolveJobId(all, typed);
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 2);
+    }
+  })();
+  console.log(await client.action(`${ACTION_SCHEME}://${action}/${encodeURIComponent(id)}`).catch((error: Error) => fail(error.message)));
 }
 
 async function sources(args: string[]): Promise<void> {
@@ -183,6 +216,9 @@ if (command.startsWith(`${ACTION_SCHEME}:`)) {
     case "start":
       await start();
       break;
+    case "jobs":
+      await jobs(rest);
+      break;
     case "sources":
       await sources(rest);
       break;
@@ -193,7 +229,7 @@ if (command.startsWith(`${ACTION_SCHEME}:`)) {
       await runSpike1();
       break;
     case "register":
-      console.log(await registerProtocol().catch((error: Error) => fail(error.message)));
+      console.log(await registerProtocol(runtimeHome()).catch((error: Error) => fail(error.message)));
       break;
     case "dispatch":
       await dispatch(rest[0] ?? fail("usage: dispatch <stremio-offline://...>", 2));

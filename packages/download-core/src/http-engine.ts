@@ -10,6 +10,11 @@ export interface HttpEngineOptions {
   progressIntervalMs?: number;
   userAgent?: string;
   now?: () => number;
+  /** Retries after a transient failure, on top of the first attempt. Default 3. */
+  retries?: number;
+  /** First backoff, doubled each retry. Default 2000 ms. */
+  retryDelayMs?: number;
+  log?: (message: string) => void;
 }
 
 /** Validators saved next to a partial file, so a resume can ask the server whether the file changed. */
@@ -21,6 +26,14 @@ interface PartMeta {
 interface Run {
   controller: AbortController;
   done: Promise<void>;
+}
+
+/** Where one job's bytes are going, carried across retries of the same transfer. */
+interface TransferState {
+  /** The path the manager planned, before any extension was learned. */
+  planned: string;
+  /** Where the bytes actually go now. */
+  target: string;
 }
 
 const EXTENSION_BY_TYPE: Readonly<Record<string, string>> = {
@@ -73,6 +86,50 @@ export function parseContentRange(header: string | null): { start: number; end: 
   return match[3] === "*" ? range : { ...range, total: Number(match[3]) };
 }
 
+/**
+ * A failure of one transfer attempt. `transient` says whether trying again could
+ * plausibly work: a dropped connection or a 503 yes, a 404 or a full disk no.
+ */
+class TransferError extends Error {
+  readonly transient: boolean;
+
+  constructor(message: string, transient: boolean) {
+    super(message);
+    this.name = "TransferError";
+    this.transient = transient;
+  }
+}
+
+/** Permanent local failures. Retrying a full disk just fails again, more slowly. */
+const FATAL_FS_CODES = new Set(["ENOSPC", "EACCES", "EPERM", "EROFS", "EISDIR", "ENAMETOOLONG"]);
+
+export function isTransientFailure(error: unknown): boolean {
+  if (error instanceof TransferError) return error.transient;
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (typeof code === "string" && FATAL_FS_CODES.has(code)) return false;
+  // Everything left is a fetch-level failure: a reset, a DNS blip, a dropped TLS session.
+  return true;
+}
+
+/** HTTP statuses worth trying again: overload, rate limit, request timeout. */
+export function isTransientStatus(status: number): boolean {
+  return status >= 500 || status === 429 || status === 408;
+}
+
+/** A timer that gives up as soon as the job is paused or cancelled. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
 /** Error text that never carries the URL: upstream URLs can embed credentials. */
 function describe(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
@@ -92,6 +149,9 @@ export class HttpEngine implements DownloadEngine {
   readonly #interval: number;
   readonly #userAgent: string;
   readonly #now: () => number;
+  readonly #retries: number;
+  readonly #retryDelayMs: number;
+  readonly #log: (message: string) => void;
   readonly #runs = new Map<string, Run>();
 
   constructor(options: HttpEngineOptions = {}) {
@@ -99,6 +159,9 @@ export class HttpEngine implements DownloadEngine {
     this.#interval = options.progressIntervalMs ?? 500;
     this.#userAgent = options.userAgent ?? "stremio-offline/0.0.1";
     this.#now = options.now ?? Date.now;
+    this.#retries = Math.max(0, Math.floor(options.retries ?? 3));
+    this.#retryDelayMs = Math.max(0, options.retryDelayMs ?? 2000);
+    this.#log = options.log ?? (() => {});
   }
 
   supports(source: OfflineSource): boolean {
@@ -120,9 +183,7 @@ export class HttpEngine implements DownloadEngine {
         await previous.done;
       }
       try {
-        await this.#transfer(job, source, events, controller.signal);
-      } catch (error) {
-        if (!controller.signal.aborted) events.error(describe(error));
+        await this.#attempt(job, source, events, controller.signal);
       } finally {
         if (this.#runs.get(job.id) === run) this.#runs.delete(job.id);
       }
@@ -146,8 +207,37 @@ export class HttpEngine implements DownloadEngine {
     }
   }
 
-  async #transfer(job: DownloadJob, source: HttpSource, events: EngineEvents, signal: AbortSignal): Promise<void> {
-    let target = job.localPath;
+  /**
+   * One transfer, retried with a doubling backoff while the failure looks
+   * transient. Each retry resumes from the partial file, so a blip at 90% costs
+   * the blip and not the 90%.
+   */
+  async #attempt(job: DownloadJob, source: HttpSource, events: EngineEvents, signal: AbortSignal): Promise<void> {
+    // Shared across attempts: the first response may rename the target by adding
+    // the extension the server implies, and a retry has to resume from THAT
+    // partial file rather than start a second one under the original name.
+    const state: TransferState = { planned: job.localPath, target: job.localPath };
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.#transfer(state, source, events, signal);
+        return;
+      } catch (error) {
+        if (signal.aborted) return;
+        const detail = describe(error);
+        if (attempt >= this.#retries || !isTransientFailure(error)) {
+          events.error(detail);
+          return;
+        }
+        const delay = this.#retryDelayMs * 2 ** attempt;
+        this.#log(`job ${job.id}: ${detail}; retrying in ${Math.round(delay / 100) / 10}s (${attempt + 1}/${this.#retries})`);
+        await sleep(delay, signal);
+        if (signal.aborted) return;
+      }
+    }
+  }
+
+  async #transfer(state: TransferState, source: HttpSource, events: EngineEvents, signal: AbortSignal): Promise<void> {
+    let target = state.target;
     let part = partPath(target);
     let offset = (await stat(part).catch(() => undefined))?.size ?? 0;
     const saved = offset > 0 ? await readPartMeta(target) : undefined;
@@ -174,11 +264,12 @@ export class HttpEngine implements DownloadEngine {
         return;
       }
       await rm(part, { force: true });
-      throw new Error("upstream rejected the resume range; the partial file was discarded");
+      // The partial file is gone, so a retry starts from zero and can succeed.
+      throw new TransferError("upstream rejected the resume range; the partial file was discarded", true);
     }
     if (!response.ok) {
       await response.body?.cancel();
-      throw new Error(`upstream responded ${response.status}`);
+      throw new TransferError(`upstream responded ${response.status}`, isTransientStatus(response.status));
     }
 
     let append = false;
@@ -187,7 +278,7 @@ export class HttpEngine implements DownloadEngine {
       const range = parseContentRange(response.headers.get("content-range"));
       if (!range || range.start !== offset) {
         await response.body?.cancel();
-        throw new Error("upstream answered with an unexpected range");
+        throw new TransferError("upstream answered with an unexpected range", false);
       }
       append = true;
       if (range.total !== undefined) total = range.total;
@@ -208,18 +299,19 @@ export class HttpEngine implements DownloadEngine {
       if (extension) {
         target = `${target}${extension}`;
         part = partPath(target);
+        state.target = target;
       }
     }
 
     const progress = (bytes: number): void => {
       const update: EngineProgress = { bytesDownloaded: bytes };
       if (total !== undefined) update.totalBytes = total;
-      if (target !== job.localPath) update.localPath = target;
+      if (target !== state.planned) update.localPath = target;
       events.progress(update);
     };
 
     const body = response.body;
-    if (!body) throw new Error("upstream sent no body");
+    if (!body) throw new TransferError("upstream sent no body", false);
 
     await mkdir(dirname(part), { recursive: true });
     const validators: PartMeta = {};
@@ -248,7 +340,8 @@ export class HttpEngine implements DownloadEngine {
     }
 
     if (total !== undefined && written !== total) {
-      throw new Error(`transfer ended after ${written} of ${total} bytes`);
+      // A short body is a dropped connection: the next attempt resumes from what landed.
+      throw new TransferError(`transfer ended after ${written} of ${total} bytes`, true);
     }
     await this.#finish(target, written, events);
   }

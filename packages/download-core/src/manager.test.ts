@@ -40,10 +40,28 @@ const source: NormalizedSource = {
 const media: JobMedia = { type: "movie", mediaId: "tt1", videoId: "tt1", title: "Interstellar" };
 const registered: RegisteredSource = { token: "t", source, media, createdAt: 0 };
 
-function setup(engine = new FakeEngine(), store = new MemoryJobStore()) {
+function setup(engine = new FakeEngine(), store = new MemoryJobStore(), maxConcurrent?: number) {
   let counter = 0;
-  const manager = new DownloadManager({ store, engine, storageDir: "/store", newId: () => `job${++counter}`, now: () => 42 });
+  let clock = 42;
+  const manager = new DownloadManager({
+    store,
+    engine,
+    storageDir: "/store",
+    newId: () => `job${++counter}`,
+    // Distinct timestamps, so the queue's oldest-first order is the enqueue order.
+    now: () => clock++,
+    ...(maxConcurrent === undefined ? {} : { maxConcurrent }),
+  });
   return { manager, engine, store };
+}
+
+/** Four different movies, so each enqueue makes its own job. */
+function forMovie(id: string): RegisteredSource {
+  return {
+    ...registered,
+    source: { ...source, key: `torrent:${id}:1` },
+    media: { ...media, mediaId: id, videoId: id },
+  };
 }
 
 test("enqueue creates a queued job and starts the engine", async () => {
@@ -159,4 +177,80 @@ test("planLocalPath sanitises and avoids collisions", () => {
     join("/s", "Movies", "Interstellar", "file name.mkv"),
   );
   assert.equal(withSuffix("/a/b/movie.mkv", "x1"), "/a/b/movie [x1].mkv");
+});
+
+test("only maxConcurrent jobs run at once; the rest wait as queued", async () => {
+  const { manager, engine } = setup(new FakeEngine(), new MemoryJobStore(), 2);
+  const jobs = [];
+  for (const id of ["tt1", "tt2", "tt3", "tt4"]) jobs.push(await manager.enqueue(forMovie(id)));
+  await manager.idle();
+
+  assert.deepEqual(engine.started, ["job1", "job2"], "two transfers, not four");
+  assert.equal(manager.running, 2);
+  assert.deepEqual(
+    (await manager.list()).map((job) => job.status),
+    ["queued", "queued", "queued", "queued"],
+  );
+
+  // Finishing one frees exactly one slot, and the oldest waiting job takes it.
+  engine.events.get("job1")!.complete({ localPath: "/store/a.mkv", totalBytes: 1 });
+  await manager.idle();
+  assert.deepEqual(engine.started, ["job1", "job2", "job3"]);
+  assert.equal(manager.running, 2);
+  assert.equal((await manager.get(jobs[0]!.id))?.status, "complete");
+
+  // So does a failure, a pause and a cancel.
+  engine.events.get("job2")!.error("no peers");
+  await manager.idle();
+  assert.deepEqual(engine.started, ["job1", "job2", "job3", "job4"]);
+
+  await manager.pause("job3");
+  await manager.idle();
+  assert.equal(manager.running, 1, "nothing is left waiting to take the freed slot");
+  assert.deepEqual(engine.started, ["job1", "job2", "job3", "job4"]);
+
+  await manager.cancel("job4");
+  await manager.idle();
+  assert.equal(manager.running, 0);
+});
+
+test("a resumed job waits its turn when every slot is busy", async () => {
+  const { manager, engine } = setup(new FakeEngine(), new MemoryJobStore(), 1);
+  const first = await manager.enqueue(forMovie("tt1"));
+  const second = await manager.enqueue(forMovie("tt2"));
+  await manager.idle();
+  assert.deepEqual(engine.started, [first.id]);
+
+  await manager.pause(first.id);
+  await manager.idle();
+  assert.deepEqual(engine.started, [first.id, second.id], "the slot goes to the waiting job");
+
+  assert.equal((await manager.resume(first.id))?.status, "queued");
+  await manager.idle();
+  assert.deepEqual(engine.started, [first.id, second.id], "and the resumed job now waits");
+  assert.equal(manager.running, 1);
+
+  engine.events.get(second.id)!.complete({ localPath: "/store/b.mkv", totalBytes: 1 });
+  await manager.idle();
+  assert.deepEqual(engine.started, [first.id, second.id, first.id]);
+});
+
+test("init puts every interrupted job back in the queue and restarts up to the limit", async () => {
+  const store = new MemoryJobStore();
+  const first = setup(new FakeEngine(), store, 4);
+  const ids = [];
+  for (const id of ["tt1", "tt2", "tt3"]) ids.push((await first.manager.enqueue(forMovie(id))).id);
+  first.engine.events.get(ids[0]!)!.progress({ bytesDownloaded: 500, totalBytes: 1000 });
+  first.engine.events.get(ids[2]!)!.complete({ localPath: "/store/c.mkv", totalBytes: 1 });
+  await first.manager.idle();
+  assert.equal((await store.get(ids[0]!))?.status, "downloading");
+
+  const second = setup(new FakeEngine(), store, 1);
+  await second.manager.init();
+  await second.manager.idle();
+  assert.deepEqual(second.engine.started, [ids[0]], "one slot, oldest first, and never the finished job");
+  const restarted = await second.manager.get(ids[0]!);
+  assert.equal(restarted?.status, "queued", "nothing is downloading until the engine says so");
+  assert.equal(restarted?.bytesDownloaded, 500, "progress is kept, so the engine resumes from it");
+  assert.equal((await second.manager.get(ids[1]!))?.status, "queued");
 });

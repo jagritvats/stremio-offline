@@ -13,6 +13,7 @@
 // download folder from runtime.json. Killing the process mid-download and
 // starting it again resumes from the partial file (§18).
 
+import { mkdir, statfs } from "node:fs/promises";
 import type { Server } from "node:http";
 import { join } from "node:path";
 import {
@@ -21,6 +22,7 @@ import {
   buildMeta,
   CATALOG_MOVIES_ID,
   CATALOG_SERIES_ID,
+  formatBytes,
   jobStatusStream,
   libraryMediaIds,
   mediaRoute,
@@ -68,7 +70,14 @@ export interface RuntimeOptions {
   metaStore?: MetaStore;
   /** null turns metadata lookups off. */
   cinemeta?: { id: string; transportUrl: string } | null;
+  /** Bytes available where downloads land. Defaults to statfs on the storage folder. */
+  freeSpace?: (dir: string) => Promise<number>;
+  /** Transfers running at once. Default 2. */
+  maxConcurrent?: number;
 }
+
+/** Left free after a download, so finishing one never fills the disk completely. */
+const DISK_HEADROOM = 256 * 1024 * 1024;
 
 export interface Runtime {
   server: Server;
@@ -99,7 +108,18 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
   const metaClient = new UpstreamClient({ ...clientOptions, timeoutMs: 5_000 });
   const cinemeta = options.cinemeta === undefined ? CINEMETA : options.cinemeta;
   const registry = new SourceRegistry();
-  const manager = new DownloadManager({ store: jobStore, engine, storageDir: config.storageDir, log });
+  const manager = new DownloadManager({
+    store: jobStore,
+    engine,
+    storageDir: config.storageDir,
+    log,
+    ...(options.maxConcurrent === undefined ? {} : { maxConcurrent: options.maxConcurrent }),
+  });
+  // Created up front so the first download does not fail on a missing folder,
+  // and so the free-space check below has something to measure.
+  await mkdir(config.storageDir, { recursive: true }).catch((error: unknown) =>
+    log(`could not create ${config.storageDir}: ${String(error)}`),
+  );
   await manager.init();
   let warnedUnsupported = false;
 
@@ -119,6 +139,33 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
       log(`runtime.json could not be re-read, keeping the last good sources: ${String(error)}`);
     }
     return config.sources.filter((source) => source.enabled);
+  }
+
+  const freeSpace =
+    options.freeSpace ??
+    (async (dir: string): Promise<number> => {
+      const { bsize, bavail } = await statfs(dir);
+      return bsize * bavail;
+    });
+
+  /**
+   * Refuse a download that plainly cannot fit. Without this the user finds out
+   * when the transfer dies with ENOSPC, having filled their disk on the way.
+   */
+  async function assertSpaceFor(bytes: number | undefined): Promise<void> {
+    if (!bytes) return;
+    let free: number;
+    try {
+      free = await freeSpace(config.storageDir);
+    } catch (error) {
+      // Unknown free space is not a reason to refuse; let the transfer try.
+      log(`could not check free space: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (free >= bytes + DISK_HEADROOM) return;
+    throw new Error(
+      `not enough space in ${config.storageDir}: needs ${formatBytes(bytes)}, ${formatBytes(free)} free`,
+    );
   }
 
   /** The real title (and a metadata snapshot for the offline library), best effort. */
@@ -188,8 +235,10 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
       if (!target) throw new Error(`${action.action} needs an id`);
       return target;
     };
+    // Reports where the job ended up rather than claiming the verb succeeded:
+    // pausing a finished download is a no-op, and saying so is the honest answer.
     const status = (job: { status: string; label: string } | undefined): string =>
-      job ? `${job.status}: ${job.label}` : "no such job";
+      job ? `${job.label} is ${job.status}` : "no such job";
 
     switch (action.action) {
       case "test":
@@ -197,6 +246,8 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
       case "enqueue": {
         const registered = registry.resolve(id());
         if (!registered) throw new Error("that entry has expired; open the title in Stremio again and tap it once more");
+        const held = await manager.findForSource(registered.media, registered.source.key);
+        if (!held || held.status === "error") await assertSpaceFor(registered.source.size);
         const media = await resolveMedia(registered.media);
         const job = await manager.enqueue({ ...registered, media });
         return `queued ${job.label} for ${media.title}`;

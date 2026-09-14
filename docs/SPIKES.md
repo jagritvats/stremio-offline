@@ -18,7 +18,7 @@ What is built, and what is next in the order it gets done.
 
 Built and unit-tested:
 
-- `models`; `addon-core` (manifest, router, presenter, `/media` with Range, offline catalog + meta); `addon-proxy` (upstream client incl. meta, normaliser, dedupe, aggregator); `download-core` (job store, meta store, source registry, download manager, HTTP engine with Range resume).
+- `models`; `addon-core` (manifest, router, presenter, `/media` with Range, offline catalog + meta); `addon-proxy` (upstream client incl. meta, normaliser, dedupe, aggregator); `download-core` (job store, meta store, source registry, download manager with a concurrency queue, HTTP engine with Range resume and retry).
 - `apps/desktop-runtime`: the runtime (`pnpm runtime`). Stream handler over the configured source addons; `enqueue/<token>` plus pause, resume, retry and cancel actions; `/media/<jobId>`; the offline library; jobs and metadata snapshots persisted under `~/.stremio-offline`; partial downloads resumed on restart. Plus the Spike 1 addon, the `stremio-offline://` dispatcher and OS registration.
 - `apps/addon-server`: the hosted install-by-URL half; empty stream list on purpose.
 
@@ -52,7 +52,7 @@ Then, in Stremio:
 2. Open any movie or episode. The stream list shows **⬇ TEST DOWNLOAD** from *Stremio Offline (Spike 1)*.
 3. Tap it.
 
-**Pass:** the terminal prints `[spike1] received test action for <id>`, and re-opening the title shows **✅ HANDLER OK** instead. Stremio stays in front. On Windows a console window may flash: that is the dispatcher process exiting, to be hidden once the spike passes.
+**Pass:** the terminal prints `[spike1] received test action for <id>`, and re-opening the title shows **✅ HANDLER OK** instead. Stremio stays in front, and no console window appears: on Windows the registered handler is `wscript.exe` running a generated `dispatch.vbs`, which starts the dispatcher hidden.
 
 **Fail:** nothing arrives, or Stremio (or a browser it hands off to) shows a prompt that goes nowhere. Record ❌ in the table with exactly what happened, per client: app version, and whether it was the Qt shell or the web UI.
 
@@ -75,8 +75,19 @@ pnpm runtime                                        # leave it running
 
 `sources list`, `sources remove <id>`, `sources enable|disable <id>` manage the addons; the running runtime picks up source changes on the next stream request, a storage change needs a restart. Install `http://127.0.0.1:34701/manifest.json` into Stremio.
 
+Downloads can also be driven from the terminal, which is easier than tapping through Stremio while testing:
+
+```sh
+pnpm runtime jobs                  # id, status, progress, title — newest first
+pnpm runtime jobs pause <id>       # <id> is the short id the listing prints
+pnpm runtime jobs resume <id>
+pnpm runtime jobs cancel <id>      # also deletes the file and any partial
+```
+
 - **Spike 3.** Open a title. Every downloadable upstream stream is listed once as `⬇ OFFLINE • <quality>` with its size and the providers offering it; the same source from two addons is one entry. Only `http(s)` sources are offered today; torrent streams wait for Spike 4.
 - **Spike 2.** Tap an HTTP entry. The terminal logs `queued`, `downloading` and `complete`; in Stremio the entry reads `⏳ N% DOWNLOADED` while it runs and `✅ OFFLINE` when done. Tap that: Stremio's own player plays `http://127.0.0.1:34701/media/<jobId>`. Check seeking, resume-from-position and subtitles.
+
+  Two transfers run at once and further taps wait as `🕓 QUEUED`, so tapping six episodes does not open six connections. A transfer that drops or hits a 5xx is retried with a doubling backoff, resuming from the partial file; a 404 or a 403 fails straight away. A download that plainly will not fit is refused at the tap rather than filling the disk first.
 - **Spike 5.** Tap an entry, stop the runtime mid-download (Ctrl-C), start it again: the log shows `downloading` again and the `.part` file grows from where it stopped. Once complete, disconnect from the network and restart Stremio: Discover → Offline Movies / Offline Series lists the title, and its `✅ OFFLINE` entry plays.
 
-State lives in `~/.stremio-offline`: `runtime.json` (port, install secret, source addons, storage folder), `jobs.json`, and `meta/` (metadata snapshots taken when a download is queued). Finished files go to `<storage>/Movies/<Title>/` and `<storage>/Series/<Title>/`; a download in progress is `<file>.part`. `apps/desktop-runtime/src/runtime.test.ts` shows the smallest source addon this can be tested against.
+State lives in `~/.stremio-offline`: `runtime.json` (port, install secret, source addons, storage folder), `jobs.json`, `meta/` (metadata snapshots taken when a download is queued), and on Windows `dispatch.vbs`. Finished files go to `<storage>/Movies/<Title>/` and `<storage>/Series/<Title>/`; a download in progress is `<file>.part`. `apps/desktop-runtime/src/runtime.test.ts` shows the smallest source addon this can be tested against.

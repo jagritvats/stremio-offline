@@ -46,6 +46,8 @@ export interface DownloadManagerOptions {
   store: JobStore;
   engine: DownloadEngine;
   storageDir: string;
+  /** Transfers running at once; the rest wait as "queued". Default 2. */
+  maxConcurrent?: number;
   now?: () => number;
   newId?: () => string;
   log?: (message: string) => void;
@@ -61,8 +63,12 @@ export class DownloadManager {
   readonly #now: () => number;
   readonly #newId: () => string;
   readonly #log: (message: string) => void;
+  readonly #maxConcurrent: number;
   readonly #listeners = new Set<ManagerListener>();
+  /** Jobs handed to the engine. Everything else with an active status is waiting for a slot. */
+  readonly #running = new Set<string>();
   #queue: Promise<unknown> = Promise.resolve();
+  #work: Promise<unknown> = Promise.resolve();
 
   constructor(options: DownloadManagerOptions) {
     this.#store = options.store;
@@ -71,17 +77,28 @@ export class DownloadManager {
     this.#now = options.now ?? Date.now;
     this.#newId = options.newId ?? (() => randomBytes(8).toString("hex"));
     this.#log = options.log ?? (() => {});
+    this.#maxConcurrent = Math.max(1, Math.floor(options.maxConcurrent ?? 2));
   }
 
-  /** Load persisted jobs and hand every active one back to the engine. */
+/**
+   * Load persisted jobs. A previous process may have died mid-transfer, so every
+   * job that was active goes back to "queued" and the queue starts as many as
+   * the concurrency limit allows; the engine resumes each from its partial file.
+   */
   async init(): Promise<void> {
     await this.#store.init();
-    for (const job of await this.#store.all()) {
-      if (isActiveJob(job)) {
-        this.#log(`resuming job ${job.id} (${job.status})`);
-        await this.#startEngine(job);
+    await this.#serial(async () => {
+      for (const job of await this.#store.all()) {
+        if (!isActiveJob(job)) continue;
+        this.#log(`resuming job ${job.id} (was ${job.status})`);
+        if (job.status !== "queued") {
+          await this.#patch(job.id, (j) => {
+            j.status = "queued";
+          });
+        }
       }
-    }
+    });
+    await this.#pump();
   }
 
   subscribe(listener: ManagerListener): () => void {
@@ -144,7 +161,7 @@ export class DownloadManager {
       this.#emit({ type: "job-updated", job });
       return { job, start: true };
     });
-    if (start) await this.#startEngine(job);
+    if (start) await this.#pump();
     return job;
   }
 
@@ -153,9 +170,12 @@ export class DownloadManager {
       const current = await this.#store.get(id);
       if (!current || !isActiveJob(current)) return current;
       await this.#engine.pause(current);
-      return this.#patch(id, (j) => {
+      this.#running.delete(id);
+      const paused = await this.#patch(id, (j) => {
         j.status = "paused";
       });
+      this.#schedulePump();
+      return paused;
     });
   }
 
@@ -172,7 +192,7 @@ export class DownloadManager {
       });
       return { job: next, start: next !== undefined };
     });
-    if (start && job) await this.#startEngine(job);
+    if (start && job) await this.#pump();
     return job;
   }
 
@@ -181,15 +201,60 @@ export class DownloadManager {
       const job = await this.#store.get(id);
       if (!job) return false;
       await this.#engine.cancel(job, deleteFiles);
+      this.#running.delete(id);
       await this.#store.delete(id);
       this.#emit({ type: "job-removed", jobId: id });
+      this.#schedulePump();
       return true;
     });
   }
 
-  /** Resolves once every queued mutation (including pending engine events) has been applied. */
-  idle(): Promise<void> {
-    return this.#queue.then(() => undefined);
+  /** Jobs the engine is transferring right now, as opposed to waiting for a slot. */
+  get running(): number {
+    return this.#running.size;
+  }
+
+  /**
+   * Resolves once every queued mutation, engine event and queue pump has settled.
+   * Each can schedule the next, so this waits until a full pass adds nothing new.
+   */
+  async idle(): Promise<void> {
+    for (let pass = 0; pass < 50; pass += 1) {
+      const queue = this.#queue;
+      const work = this.#work;
+      await queue.catch(() => undefined);
+      await work.catch(() => undefined);
+      if (this.#queue === queue && this.#work === work) return;
+    }
+    this.#log("idle() gave up waiting for the job queue to settle");
+  }
+
+  /** Start as many waiting jobs as the concurrency limit allows. */
+  async #pump(): Promise<void> {
+    const claimed = await this.#serial(() => this.#claimSlots());
+    for (const job of claimed) await this.#startEngine(job);
+  }
+
+  /** Fire a pump after the current serial task, for callers that must not await it. */
+  #schedulePump(): void {
+    this.#work = this.#work
+      .then(
+        () => this.#pump(),
+        () => this.#pump(),
+      )
+      .catch((error: unknown) => this.#log(`queue pump failed: ${String(error)}`));
+  }
+
+  /** Take the oldest waiting jobs, up to the free slots. Callers must hold the serial queue. */
+  async #claimSlots(): Promise<DownloadJob[]> {
+    const free = this.#maxConcurrent - this.#running.size;
+    if (free <= 0) return [];
+    const waiting = (await this.#store.all())
+      .filter((job) => isActiveJob(job) && !this.#running.has(job.id))
+      .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
+      .slice(0, free);
+    for (const job of waiting) this.#running.add(job.id);
+    return waiting;
   }
 
   async #startEngine(job: DownloadJob): Promise<void> {
@@ -198,12 +263,14 @@ export class DownloadManager {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.#log(`job ${job.id}: engine failed to start: ${message}`);
+      this.#running.delete(job.id);
       await this.#serial(() =>
         this.#patch(job.id, (j) => {
           j.status = "error";
           j.error = message;
         }),
       );
+      this.#schedulePump();
     }
   }
 
@@ -226,19 +293,25 @@ export class DownloadManager {
           if (update.localPath) j.localPath = update.localPath;
           if (j.status !== "downloading") j.status = "downloading";
         }),
-      complete: (result) =>
+      complete: (result) => {
+        this.#running.delete(jobId);
         apply((j) => {
           j.status = "complete";
           j.localPath = result.localPath;
           j.totalBytes = result.totalBytes;
           j.bytesDownloaded = result.totalBytes;
           delete j.error;
-        }),
-      error: (message) =>
+        });
+        this.#schedulePump();
+      },
+      error: (message) => {
+        this.#running.delete(jobId);
         apply((j) => {
           j.status = "error";
           j.error = message;
-        }),
+        });
+        this.#schedulePump();
+      },
     };
   }
 

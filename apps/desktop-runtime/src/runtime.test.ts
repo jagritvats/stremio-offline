@@ -67,14 +67,20 @@ function upstreamFor(fileUrl: string): FetchLike {
   };
 }
 
-async function startRuntime(home: string, config: RuntimeConfig, upstreamFetch: FetchLike) {
+async function startRuntime(
+  home: string,
+  config: RuntimeConfig,
+  upstreamFetch: FetchLike,
+  overrides: Partial<Parameters<typeof createRuntime>[0]> = {},
+) {
   const runtime = await createRuntime({
     home,
     config,
     version: "0.0.1",
     upstreamFetch,
     cinemeta: { id: "cinemeta", transportUrl: "https://cinemeta.example" },
-    engine: new HttpEngine({ progressIntervalMs: 0 }),
+    engine: new HttpEngine({ progressIntervalMs: 0, retryDelayMs: 1 }),
+    ...overrides,
   });
   const { port } = await listen(runtime.server, 0);
   const base = `http://127.0.0.1:${port}`;
@@ -179,6 +185,54 @@ test("runtime: an upstream stream becomes ⬇ OFFLINE, a tap downloads it, and i
     assert.equal((await second.get<MetaResponse>("/meta/movie/tt1.json")).meta.poster, "https://img/p.jpg");
   } finally {
     await second.runtime.close();
+    await content.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a download that cannot fit is refused before anything is written", async () => {
+  const home = await mkdtemp(join(tmpdir(), "so-space-"));
+  const content = await contentServer();
+  const config: RuntimeConfig = {
+    version: 1,
+    port: 0,
+    secret: SECRET,
+    storageDir: join(home, "downloads"),
+    sources: [
+      {
+        id: "up",
+        name: "Upstream",
+        manifestUrl: "https://up.example/manifest.json",
+        transportUrl: "https://up.example",
+        enabled: true,
+      },
+    ],
+  };
+  await writeConfig(home, config);
+
+  const full = await startRuntime(home, config, upstreamFor(content.url), { freeSpace: async () => 1024 });
+  try {
+    const [entry] = await full.streams();
+    const refused = await full.action(entry?.externalUrl ?? "");
+    assert.equal(refused.status, 400);
+    assert.match(((await refused.json()) as { error: string }).error, /not enough space.*needs 200 KB.*1 KB free/);
+    assert.deepEqual(await full.runtime.manager.list(), [], "nothing is queued and nothing is on disk");
+  } finally {
+    await full.runtime.close();
+  }
+
+  // The same tap succeeds once the space is there, and an unreadable disk never blocks a download.
+  const unknown = await startRuntime(home, config, upstreamFor(content.url), {
+    freeSpace: async () => {
+      throw new Error("statfs failed");
+    },
+  });
+  try {
+    const [entry] = await unknown.streams();
+    assert.equal((await unknown.action(entry?.externalUrl ?? "")).status, 200);
+    await untilComplete(unknown.runtime);
+  } finally {
+    await unknown.runtime.close();
     await content.close();
     await rm(home, { recursive: true, force: true });
   }

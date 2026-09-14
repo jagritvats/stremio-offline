@@ -31,6 +31,7 @@ pnpm register     # once: stremio-offline:// → the local runtime (Windows, Lin
 pnpm spike:1      # start the hello-offline addon for Spike 1 (docs/SPIKES.md)
 pnpm runtime sources add <manifest url>   # add a stream addon to mirror
 pnpm runtime      # start the runtime: HTTP downloads, /media playback, offline library
+pnpm runtime jobs # list downloads; jobs pause|resume|cancel <id> acts on one
 ```
 
 Requires Node 22+ and pnpm 9.
