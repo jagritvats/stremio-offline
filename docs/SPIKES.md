@@ -4,7 +4,7 @@ Build order from [DESIGN.md §23](DESIGN.md#23-critical-build-order). Each spike
 
 | # | Spike | Windows | Android | Notes |
 |---|-------|---------|---------|-------|
-| 1 | Action integration (`externalUrl` → custom URI handler) | ☐ | ☐ | make-or-break · runnable: `pnpm spike:1` |
+| 1 | Action integration (`externalUrl` → custom URI handler) | ☐ | ☐ | make-or-break · runnable: `pnpm spike:1`, and `apps/android-runtime` |
 | 2 | Local playback (`url` → localhost file endpoint with Range) | ☐ | ☐ | runnable: `pnpm runtime` with an HTTP source |
 | 3 | Upstream proxy (normalise one source addon into `⬇ OFFLINE`) | ☐ | ☐ | runnable: `pnpm runtime` |
 | 4 | Torrent (infoHash + fileIdx → file → `✅ OFFLINE`) | ☐ | ☐ | not started: gated on Spike 1 (CLAUDE.md) |
@@ -21,18 +21,20 @@ Built and unit-tested:
 - `models`; `addon-core` (manifest, router, presenter, `/media` with Range, offline catalog + meta); `addon-proxy` (upstream client incl. meta, normaliser, dedupe, aggregator); `download-core` (job store, meta store, source registry, download manager with a concurrency queue, HTTP engine with Range resume and retry).
 - `apps/desktop-runtime`: the runtime (`pnpm runtime`). Stream handler over the configured source addons; `enqueue/<token>` plus pause, resume, retry and cancel actions; `/media/<jobId>`; the offline library; jobs and metadata snapshots persisted under `~/.stremio-offline`; partial downloads resumed on restart. Plus the Spike 1 addon, the `stremio-offline://` dispatcher and OS registration.
 - `apps/addon-server`: the hosted install-by-URL half; empty stream list on purpose.
+- `apps/android-runtime`: a Gradle project holding Spike 1 only — the addon on loopback, the `stremio-offline://` activity, a foreground service, no dependencies. Written without an Android SDK available and **never compiled**; see its README.
 
 Not built:
 
 - The torrent engine (Spike 4). CLAUDE.md gates it on Spike 1. Until it exists the runtime lists only sources an engine can transfer, so torrent streams from upstream addons are not offered as `⬇ OFFLINE` yet (the log says how many were hidden).
-- `apps/android-runtime` (README only).
+- Everything on Android past Spike 1: downloads, `/media`, the library, the install secret, storage selection.
 
 Next, in order:
 
 1. **Spike 1 on Windows** (below). Everything hinges on it.
-2. **Spikes 2, 3 and 5 against real Stremio** with an HTTP source (below): seeking, subtitles and resume in Stremio's player; kill and restart mid-download; play with the network off.
-3. **Torrent engine** (Spike 4), behind the same `DownloadEngine` interface, picked by `source.type`.
-4. **Android**: a deep-link activity that does what `dispatch` does (POST the URI to `/api/action` with the install secret), then the runtime pieces in Kotlin.
+2. **Spike 1 on Android**: build `apps/android-runtime` and run it (its README has the steps). The app carries everything the spike needs and has never been compiled, so building it is part of the job.
+3. **Spikes 2, 3 and 5 against real Stremio** with an HTTP source (below): seeking, subtitles and resume in Stremio's player; kill and restart mid-download; play with the network off.
+4. **Torrent engine** (Spike 4), behind the same `DownloadEngine` interface, picked by `source.type`.
+5. **The Android runtime**: downloads in the foreground service, `/media`, the library, an install secret on anything privileged, a user-chosen storage folder. Its README lists the gaps.
 
 ## Running Spike 1
 

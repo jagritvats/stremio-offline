@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { DownloadJob, JobMedia, OfflineMeta } from "@stremio-offline/models";
-import { buildCatalog, buildMeta, libraryMediaIds, snapshotMeta } from "./library.ts";
+import { buildCatalog, buildMeta, isLibraryJob, libraryMediaIds, snapshotMeta } from "./library.ts";
 
 function job(id: string, media: JobMedia, updatedAt: number): DownloadJob {
   return {
@@ -85,4 +85,28 @@ test("snapshotMeta copies only what is present", () => {
     poster: "p",
     savedAt: 7,
   });
+});
+
+test("a title whose downloads all failed is not in the offline library", () => {
+  const failed = { ...job("e", { type: "movie", mediaId: "tt5", videoId: "tt5", title: "Broken" }, 99), status: "error" as const, error: "no peers" };
+  const withFailure = [...jobs, failed];
+
+  assert.ok(!libraryMediaIds("movie", withFailure).includes("tt5"), "nothing to play, so nothing to list");
+  assert.deepEqual(buildCatalog("movie", withFailure, new Map(), {}).metas.map((meta) => meta.id), ["tt3", "tt1"]);
+  assert.equal(buildMeta("movie", "tt5", withFailure, undefined), null, "and no meta promising it either");
+
+  // A title that still has a live job stays, whatever else failed for it.
+  const alsoQueued = { ...failed, id: "f", status: "queued" as const, sourceKey: "other" };
+  assert.ok(libraryMediaIds("movie", [...withFailure, alsoQueued]).includes("tt5"));
+  assert.ok(isLibraryJob({ status: "paused" }) && isLibraryJob({ status: "complete" }));
+  assert.ok(!isLibraryJob({ status: "error" }));
+});
+
+test("failed episodes are left out of a series meta", () => {
+  const broken = {
+    ...job("g", { type: "series", mediaId: "tt2", videoId: "tt2:1:3", season: 1, episode: 3, title: "Severance" }, 40),
+    status: "error" as const,
+  };
+  const videos = buildMeta("series", "tt2", [...jobs, broken], undefined)?.meta.videos;
+  assert.deepEqual(videos?.map((video) => video.id), ["tt2:1:1", "tt2:1:2"], "S01E03 never downloaded");
 });

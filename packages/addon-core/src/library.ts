@@ -21,11 +21,20 @@ export function snapshotMeta(meta: StremioMeta, type: MediaType, now: number = D
   return snapshot;
 }
 
-/** Title-level ids of this type with at least one job, most recently touched first. */
+/**
+ * A job belongs in the library when it holds bytes, or will. A failed download
+ * holds nothing: listing it under "Offline Movies" promises a title that cannot
+ * be played and, once every job for it has failed, nothing there can fix it.
+ */
+export function isLibraryJob(job: Pick<DownloadJob, "status">): boolean {
+  return job.status !== "error";
+}
+
+/** Title-level ids of this type that the library should show, most recently touched first. */
 export function libraryMediaIds(type: MediaType, jobs: DownloadJob[]): string[] {
   const latest = new Map<string, number>();
   for (const job of jobs) {
-    if (job.media.type !== type) continue;
+    if (job.media.type !== type || !isLibraryJob(job)) continue;
     latest.set(job.media.mediaId, Math.max(latest.get(job.media.mediaId) ?? 0, job.updatedAt));
   }
   return [...latest.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
@@ -73,7 +82,7 @@ export function buildMeta(
   jobs: DownloadJob[],
   meta: OfflineMeta | undefined,
 ): MetaResponse | null {
-  const mine = jobs.filter((job) => job.media.type === type && job.media.mediaId === mediaId);
+  const mine = jobs.filter((job) => job.media.type === type && job.media.mediaId === mediaId && isLibraryJob(job));
   if (!meta && mine.length === 0) return null;
 
   const full: StremioMeta = catalogEntry(type, mediaId, mine, meta);
